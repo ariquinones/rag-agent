@@ -1,0 +1,130 @@
+// watcher will watch files added to the ingest directory
+// built with fsnotify github package
+package ingest
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"rag-agent/llm"
+	"rag-agent/vector"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+)
+
+const (
+	DEBOUNCE_DELAY = 500 * time.Millisecond
+)
+
+func Watch(ctx context.Context, opts Options, embedder llm.Embedder, store vector.Store, logger *log.Logger) error {
+	if filepath.Clean(opts.SourceDir) == filepath.Clean(opts.ProcessedDir) {
+		return errors.New("source and processed directory must differ")
+	}
+	if err := os.MkdirAll(opts.SourceDir, 0o755); err != nil {
+		return fmt.Errorf("create source dir: %w", err)
+	}
+	if err := os.MkdirAll(opts.ProcessedDir, 0o755); err != nil {
+		return fmt.Errorf("create processed dir: %w", err)
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("create watcher: %w", err)
+	}
+	defer watcher.Close()
+	if err := watcher.Add(opts.SourceDir); err != nil {
+		return fmt.Errorf("unable to watch source dir: %w", err)
+	}
+	processedAbs, err := filepath.Abs(opts.ProcessedDir)
+	if err != nil {
+		return fmt.Errorf("resolve processed dir: %w", err)
+	}
+	handle := func(path string) {
+		if err := processFile(ctx, path, opts, embedder, store); err != nil {
+			logger.Printf("process %s: %v", filepath.Base(path), err)
+			return
+		}
+		newDestination := filepath.Join(opts.ProcessedDir, filepath.Base(path))
+		if err := os.Rename(path, newDestination); err != nil {
+			logger.Printf("move %s to processed dir %w", newDestination, err)
+			return
+		}
+		logger.Printf("ingested %s", filepath.Base(path))
+	}
+
+	entries, err := os.ReadDir(opts.SourceDir)
+	if err != nil {
+		return fmt.Errorf("read source dir: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		go handle(filepath.Join(opts.SourceDir, e.Name()))
+	}
+
+	var (
+		timersMu sync.Mutex
+		timers   = make(map[string]*time.Timer)
+	)
+	schedule := func(path string) {
+		timersMu.Lock()
+		defer timersMu.Unlock()
+		if t, ok := timers[path]; ok {
+			t.Reset(DEBOUNCE_DELAY)
+			return
+		}
+		timers[path] = time.AfterFunc(DEBOUNCE_DELAY, func() {
+			timersMu.Lock()
+			delete(timers, path)
+			timersMu.Unlock()
+			handle(path)
+		})
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			// check if file is still being written to
+			if ev.Op&(fsnotify.Create|fsnotify.Write) == 0 {
+				continue
+			}
+			if !shouldProcess(ev.Name, processedAbs) {
+				continue
+			}
+			schedule(ev.Name)
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+			logger.Printf("watcher error: %w", err)
+		}
+	}
+}
+
+func shouldProcess(path string, dir string) bool {
+	if strings.HasPrefix(filepath.Base(path), ".") {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	if dir != "" && strings.HasPrefix(abs, dir+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
